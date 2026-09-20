@@ -1,0 +1,21 @@
+# Arduino
+*.hex
+*.bin
+*.elf
+*.map
+
+# Build folders
+build/
+.pio/
+
+# IDE
+.vscode/
+
+# Secrets
+secrets.h
+*.key
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db

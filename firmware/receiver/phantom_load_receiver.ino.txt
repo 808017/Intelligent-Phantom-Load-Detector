@@ -1,0 +1,1520 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <esp_wifi.h>
+#include <Preferences.h>
+
+// Pin definitions
+#define BUZZER_PIN 25
+#define MODE_BUTTON_PIN 23  // Optional button for manual mode switching
+
+// WiFi credentials - REPLACE WITH YOUR DETAILS
+const char* ssid = "AndroidAP";
+const char* password = "12345678";
+
+// Adafruit IO MQTT settings - REPLACE WITH YOUR DETAILS
+const char* mqtt_server = "io.adafruit.com";
+const int mqtt_port = ;
+const char* mqtt_username = hide;
+const char* mqtt_password = hide;
+
+// MQTT topics (replace YOUR_USERNAME with your Adafruit IO username)
+const char* voltage_feed = "yash_mane/feeds/live-voltage";
+const char* current_feed = "yash_mane/feeds/live-current";
+const char* power_feed = "yash_mane/feeds/power";
+const char* power_factor_feed = "yash_mane/feeds/power-factor";
+const char* phantom_feed = "yash_mane/feeds/phantom-voltage";
+const char* status_feed = "yash_mane/feeds/system-status";
+const char* alert_feed = "yash_mane/feeds/voltage-alerts";
+const char* energy_feed = "yash_mane/feeds/energy-consumption";
+const char* statistics_feed = "yash_mane/feeds/statistics";
+
+// Initialize components
+LiquidCrystal_I2C lcd(0x27, 16, 4); // Address might be 0x3F for some modules
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+Preferences preferences;
+
+// Enhanced thresholds (configurable via serial commands)
+float lowVoltageThreshold = 200.0;    // Alert if below 200V
+float highVoltageThreshold = 250.0;   // Alert if above 250V
+float phantomThreshold = 5.0;         // Alert if phantom > 5V
+float highCurrentThreshold = 25.0;    // Alert if current > 25A
+float highPowerThreshold = 5000.0;    // Alert if power > 5kW
+float lowPowerFactorThreshold = 0.7;  // Alert if PF < 0.7
+
+// Data structure (must match sender's structure)
+typedef struct {
+  float liveVoltage;
+  float phantomVoltage;
+  float current;
+  float power;
+  float powerFactor;
+  unsigned long timestamp;
+  bool isMainsOn;
+  int signalStrength;
+} SensorData;
+
+SensorData receivedData;
+SensorData lastValidData; // Store last valid data for comparison
+bool newDataReceived = false;
+bool dataValid = false;
+
+// Enhanced timing variables
+unsigned long lastMqttSend = 0;
+unsigned long lastDataReceived = 0;
+unsigned long lastStatusUpdate = 0;
+const unsigned long MQTT_SEND_INTERVAL = 5000;      // Send to MQTT every 5 seconds
+const unsigned long DATA_TIMEOUT = 15000;           // Consider data stale after 15 seconds
+const unsigned long STATUS_UPDATE_INTERVAL = 1000;  // Update status every second
+
+// Enhanced energy calculation
+float totalEnergyWh = 0.0;            // Total energy in Watt-hours
+float dailyEnergyWh = 0.0;            // Daily energy consumption
+unsigned long lastEnergyUpdate = 0;
+unsigned long dayStartTime = 0;
+const unsigned long ENERGY_UPDATE_INTERVAL = 10000; // Update energy every 10 seconds
+const unsigned long DAY_RESET_INTERVAL = 86400000;  // 24 hours in milliseconds
+
+// Enhanced buzzer variables
+bool buzzerState = false;
+bool buzzerEnabled = true;            // Can be toggled via serial
+unsigned long lastBuzzerToggle = 0;
+int buzzerTone = 1000;
+String currentAlert = "";
+int alertCount = 0;
+
+// Enhanced display mode switching
+enum DisplayMode {
+  BASIC_DISPLAY,
+  POWER_DISPLAY,
+  ENERGY_DISPLAY,
+  STATUS_DISPLAY,
+  STATISTICS_DISPLAY,
+  DEBUG_DISPLAY
+};
+
+DisplayMode displayMode = BASIC_DISPLAY;
+unsigned long lastDisplayChange = 0;
+const unsigned long DISPLAY_CHANGE_INTERVAL = 4000; // Change display every 4 seconds
+bool autoDisplayChange = true; // Can be toggled via serial
+
+// Enhanced channel management
+int wifiChannel = 11; // Force channel 11
+bool channelLocked = false;
+int channelScanAttempts = 0;
+
+// Statistics tracking
+struct Statistics {
+  float maxVoltage = 0.0;
+  float minVoltage = 999.0;
+  float maxCurrent = 0.0;
+  float maxPower = 0.0;
+  float avgVoltage = 0.0;
+  float avgCurrent = 0.0;
+  float avgPower = 0.0;
+  unsigned long dataPoints = 0;
+  unsigned long successfulTransmissions = 0;
+  unsigned long failedTransmissions = 0;
+  unsigned long lastReset = 0;
+} stats;
+
+// Data quality monitoring
+struct DataQuality {
+  float voltageStability = 0.0;
+  float currentStability = 0.0;
+  int consecutiveTimeouts = 0;
+  int totalTimeouts = 0;
+  float averageSignalStrength = 0.0;
+} dataQuality;
+
+
+// ===================================
+// === FUNCTION PROTOTYPES (DECLARATIONS) ===
+// ===================================
+void onDataReceived(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len);
+void connectToWiFiWithChannelLock();
+void reconnectWiFiSameChannel();
+void forceChannel11();
+void printNetworkDiagnostics();
+void updateStatistics();
+void updateDataQuality();
+void reconnectMQTT();
+void updateEnergy();
+void sendToMQTT();
+void updateLCD();
+void displayBasicInfo();
+void displayPowerInfo();
+void displayEnergyInfo();
+void displayStatusInfo();
+void displayStatistics();
+void displayDebugInfo();
+void displayConnectionStatus();
+void checkAlerts();
+void handleBuzzer();
+void handleModeButton();
+void handleSerialCommands();
+void printHelp();
+void printSystemStatus();
+void saveSettings();
+void loadSettings();
+void resetStatistics();
+
+
+// ========================================
+// === FUNCTION DEFINITIONS ===
+// ========================================
+
+void sendToMQTT() {
+  if (!mqttClient.connected()) return;
+  
+  // Send all measurements
+  mqttClient.publish(voltage_feed, String(receivedData.liveVoltage, 2).c_str());
+  mqttClient.publish(current_feed, String(receivedData.current, 4).c_str());
+  mqttClient.publish(power_feed, String(receivedData.power, 2).c_str());
+  mqttClient.publish(power_factor_feed, String(receivedData.powerFactor, 3).c_str());
+  mqttClient.publish(phantom_feed, String(receivedData.phantomVoltage, 2).c_str());
+  mqttClient.publish(energy_feed, String(totalEnergyWh, 3).c_str());
+  
+  // Send system status
+  String status = receivedData.isMainsOn ? "MAINS_ON" : 
+                  (receivedData.phantomVoltage > 0.5 ? "PHANTOM_DETECTED" : "OFF");
+  mqttClient.publish(status_feed, status.c_str());
+  
+  // Create comprehensive JSON payload with enhanced data
+  DynamicJsonDocument doc(2048);
+  doc["live_voltage"] = round(receivedData.liveVoltage * 100) / 100.0;
+  doc["current"] = round(receivedData.current * 10000) / 10000.0;
+  doc["power"] = round(receivedData.power * 100) / 100.0;
+  doc["power_factor"] = round(receivedData.powerFactor * 1000) / 1000.0;
+  doc["phantom_voltage"] = round(receivedData.phantomVoltage * 100) / 100.0;
+  doc["total_energy_wh"] = round(totalEnergyWh * 1000) / 1000.0;
+  doc["daily_energy_wh"] = round(dailyEnergyWh * 1000) / 1000.0;
+  doc["is_mains_on"] = receivedData.isMainsOn;
+  doc["sender_timestamp"] = receivedData.timestamp;
+  doc["receiver_timestamp"] = millis();
+  doc["data_age_ms"] = millis() - lastDataReceived;
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["sender_signal"] = receivedData.signalStrength;
+  doc["alert_active"] = buzzerState;
+  doc["current_alert"] = currentAlert;
+  doc["wifi_channel"] = WiFi.channel();
+  doc["apparent_power"] = round(receivedData.liveVoltage * receivedData.current * 100) / 100.0;
+  
+  // Add statistics
+  JsonObject stats_obj = doc.createNestedObject("statistics");
+  stats_obj["max_voltage"] = round(stats.maxVoltage * 100) / 100.0;
+  stats_obj["min_voltage"] = round(stats.minVoltage * 100) / 100.0;
+  stats_obj["max_current"] = round(stats.maxCurrent * 10000) / 10000.0;
+  stats_obj["max_power"] = round(stats.maxPower * 100) / 100.0;
+  stats_obj["avg_voltage"] = round(stats.avgVoltage * 100) / 100.0;
+  stats_obj["avg_current"] = round(stats.avgCurrent * 10000) / 10000.0;
+  stats_obj["avg_power"] = round(stats.avgPower * 100) / 100.0;
+  stats_obj["data_points"] = stats.dataPoints;
+  stats_obj["successful_tx"] = stats.successfulTransmissions;
+  stats_obj["failed_tx"] = stats.failedTransmissions;
+  stats_obj["voltage_stability"] = round(dataQuality.voltageStability * 100) / 100.0;
+  stats_obj["avg_signal"] = round(dataQuality.averageSignalStrength * 10) / 10.0;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  mqttClient.publish(statistics_feed, jsonString.c_str());
+  
+  Serial.print("Sent to MQTT: ");
+  Serial.print(jsonString.length());
+  Serial.println(" bytes");
+}
+
+void updateLCD() {
+  lcd.clear();
+  
+  if (!dataValid) {
+    // No fresh data available
+    lcd.setCursor(0, 0);
+    lcd.print("NO DATA FROM    ");
+    lcd.setCursor(0, 1);
+    lcd.print("SENDER UNIT     ");
+    lcd.setCursor(0, 2);
+    lcd.print("Timeouts: ");
+    lcd.print(dataQuality.consecutiveTimeouts);
+    lcd.setCursor(0, 3);
+    lcd.print("Ch:");
+    lcd.print(WiFi.channel());
+    lcd.print(" Age:");
+    lcd.print((millis() - lastDataReceived) / 1000);
+    lcd.print("s");
+    return;
+  }
+  
+  switch (displayMode) {
+    case BASIC_DISPLAY:
+      displayBasicInfo();
+      break;
+    case POWER_DISPLAY:
+      displayPowerInfo();
+      break;
+    case ENERGY_DISPLAY:
+      displayEnergyInfo();
+      break;
+    case STATUS_DISPLAY:
+      displayStatusInfo();
+      break;
+    case STATISTICS_DISPLAY:
+      displayStatistics();
+      break;
+    case DEBUG_DISPLAY:
+      displayDebugInfo();
+      break;
+  }
+  
+  // Always show connection status on line 4
+  displayConnectionStatus();
+}
+
+void displayBasicInfo() {
+  // Line 1: Voltage
+  lcd.setCursor(0, 0);
+  lcd.print("Voltage: ");
+  if (receivedData.liveVoltage > 10) {
+    lcd.print((int)receivedData.liveVoltage);
+    lcd.print("V");
+  } else {
+    lcd.print("OFF");
+  }
+  
+  // Line 2: Current
+  lcd.setCursor(0, 1);
+  lcd.print("Current: ");
+  if (receivedData.current >= 1.0) {
+    lcd.print(receivedData.current, 2);
+    lcd.print("A");
+  } else if (receivedData.current >= 0.001) {
+    lcd.print((int)(receivedData.current * 1000));
+    lcd.print("mA");
+  } else {
+    lcd.print("0mA");
+  }
+  
+  // Line 3: Power with alert indicator
+  lcd.setCursor(0, 2);
+  lcd.print("Power: ");
+  if (receivedData.power >= 1000) {
+    lcd.print(receivedData.power/1000, 1);
+    lcd.print("kW");
+  } else if (receivedData.power >= 1) {
+    lcd.print((int)receivedData.power);
+    lcd.print("W");
+  } else {
+    lcd.print("0W");
+  }
+  
+  if (buzzerState) {
+    lcd.setCursor(12, 2);
+    lcd.print("ALRT");
+  }
+}
+
+void displayPowerInfo() {
+  // Line 1: Real Power
+  lcd.setCursor(0, 0);
+  lcd.print("Real: ");
+  if (receivedData.power >= 1000) {
+    lcd.print(receivedData.power/1000, 1);
+    lcd.print("kW");
+  } else {
+    lcd.print((int)receivedData.power);
+    lcd.print("W");
+  }
+  
+  // Line 2: Apparent Power
+  lcd.setCursor(0, 1);
+  lcd.print("Apparent: ");
+  float apparentPower = receivedData.liveVoltage * receivedData.current;
+  if (apparentPower >= 1000) {
+    lcd.print(apparentPower/1000, 1);
+    lcd.print("kVA");
+  } else {
+    lcd.print((int)apparentPower);
+    lcd.print("VA");
+  }
+  
+  // Line 3: Power Factor with quality indicator
+  lcd.setCursor(0, 2);
+  lcd.print("PF: ");
+  lcd.print(receivedData.powerFactor, 2);
+  
+  if (receivedData.powerFactor < 0.8 && receivedData.power > 50) {
+    lcd.setCursor(12, 2);
+    lcd.print("LOW");
+  } else if (receivedData.powerFactor > 0.95 && receivedData.power > 50) {
+    lcd.setCursor(12, 2);
+    lcd.print("GOOD");
+  }
+}
+
+void displayEnergyInfo() {
+  // Line 1: Total Energy
+  lcd.setCursor(0, 0);
+  lcd.print("Total: ");
+  if (totalEnergyWh >= 1000) {
+    lcd.print(totalEnergyWh / 1000.0, 2);
+    lcd.print("kWh");
+  } else {
+    lcd.print((int)totalEnergyWh);
+    lcd.print("Wh");
+  }
+  
+  // Line 2: Daily Energy
+  lcd.setCursor(0, 1);
+  lcd.print("Today: ");
+  if (dailyEnergyWh >= 1000) {
+    lcd.print(dailyEnergyWh / 1000.0, 2);
+    lcd.print("kWh");
+  } else {
+    lcd.print((int)dailyEnergyWh);
+    lcd.print("Wh");
+  }
+  
+  // Line 3: Current Power
+  lcd.setCursor(0, 2);
+  lcd.print("Now: ");
+  if (receivedData.power >= 1000) {
+    lcd.print(receivedData.power/1000, 1);
+    lcd.print("kW");
+  } else {
+    lcd.print((int)receivedData.power);
+    lcd.print("W");
+  }
+}
+
+void displayStatusInfo() {
+  // Line 1: System Status
+  lcd.setCursor(0, 0);
+  if (receivedData.isMainsOn && receivedData.current > 0.001) {
+    lcd.print("Status: LOAD ON ");
+  } else if (receivedData.isMainsOn) {
+    lcd.print("Status: MAINS ON");
+  } else if (receivedData.phantomVoltage > 0.1) {
+    lcd.print("Status: PHANTOM ");
+  } else {
+    lcd.print("Status: OFF       ");
+  }
+  
+  // Line 2: Phantom voltage/current if present
+  lcd.setCursor(0, 1);
+  if (receivedData.phantomVoltage > 0.1) {
+    lcd.print("Phantom: ");
+    lcd.print((int)receivedData.phantomVoltage);
+    lcd.print("V");
+  } else {
+    lcd.print("No Phantom       ");
+  }
+  
+  // Line 3: Current alert
+  lcd.setCursor(0, 2);
+  if (currentAlert != "") {
+    lcd.print("Alert: ");
+    lcd.print(currentAlert);
+    // Pad with spaces to clear line
+    for (int i = 7 + currentAlert.length(); i < 16; i++) {
+      lcd.print(" ");
+    }
+  } else {
+    lcd.print("All Systems OK  ");
+  }
+}
+
+void displayStatistics() {
+  // Line 1: Max values
+  lcd.setCursor(0, 0);
+  lcd.print("Max V:");
+  lcd.print((int)stats.maxVoltage);
+  lcd.print(" I:");
+  lcd.print((int)(stats.maxCurrent * 1000));
+  lcd.print("mA");
+  
+  // Line 2: Averages
+  lcd.setCursor(0, 1);
+  lcd.print("Avg V:");
+  lcd.print((int)stats.avgVoltage);
+  lcd.print(" P:");
+  lcd.print((int)stats.avgPower);
+  lcd.print("W");
+  
+  // Line 3: Data quality
+  lcd.setCursor(0, 2);
+  lcd.print("Pts:");
+  lcd.print(stats.dataPoints);
+  lcd.print(" Stb:");
+  lcd.print(dataQuality.voltageStability, 1);
+  lcd.print("V");
+}
+
+void displayDebugInfo() {
+  // Line 1: Signal quality
+  lcd.setCursor(0, 0);
+  lcd.print("RSSI:");
+  lcd.print(receivedData.signalStrength);
+  lcd.print(" Avg:");
+  lcd.print((int)dataQuality.averageSignalStrength);
+  
+  // Line 2: Transmission stats
+  lcd.setCursor(0, 1);
+  lcd.print("TX OK:");
+  lcd.print(stats.successfulTransmissions);
+  lcd.print(" FL:");
+  lcd.print(stats.failedTransmissions);
+  
+  // Line 3: Timeout info
+  lcd.setCursor(0, 2);
+  lcd.print("TO:");
+  lcd.print(dataQuality.totalTimeouts);
+  lcd.print(" Con:");
+  lcd.print(dataQuality.consecutiveTimeouts);
+}
+
+void displayConnectionStatus() {
+  // Line 4: Connection status (always shown)
+  lcd.setCursor(0, 3);
+  
+  // ESP-NOW status
+  if (dataValid) {
+    lcd.print("RX:OK ");
+  } else {
+    lcd.print("RX:-- ");
+  }
+  
+  // WiFi status
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.print("WiFi:OK ");
+  } else {
+    lcd.print("WiFi:-- ");
+  }
+  
+  // Channel and MQTT status
+  lcd.print("C");
+  lcd.print(WiFi.channel());
+  if (mqttClient.connected()) {
+    lcd.print("M");
+  } else {
+    lcd.print("-");
+  }
+  
+  // Show display mode indicator
+  lcd.setCursor(15, 3);
+  lcd.print(displayMode);
+}
+
+void checkAlerts() {
+  bool shouldAlert = false;
+  String alertMsg = "";
+  
+  // Check for low voltage
+  if (receivedData.isMainsOn && receivedData.liveVoltage < lowVoltageThreshold) {
+    alertMsg = "LOW_VOLTAGE:" + String(receivedData.liveVoltage, 1) + "V";
+    currentAlert = "LOW_V";
+    shouldAlert = true;
+    buzzerTone = 500; // Low frequency for low voltage
+  }
+  
+  // Check for high voltage
+  else if (receivedData.isMainsOn && receivedData.liveVoltage > highVoltageThreshold) {
+    alertMsg = "HIGH_VOLTAGE:" + String(receivedData.liveVoltage, 1) + "V";
+    currentAlert = "HIGH_V";
+    shouldAlert = true;
+    buzzerTone = 2000; // High frequency for high voltage
+  }
+  
+  // Check for high current
+  else if (receivedData.isMainsOn && receivedData.current > highCurrentThreshold) {
+    alertMsg = "HIGH_CURRENT:" + String(receivedData.current, 2) + "A";
+    currentAlert = "HIGH_I";
+    shouldAlert = true;
+    buzzerTone = 1800; // High frequency for high current
+  }
+  
+  // Check for high power
+  else if (receivedData.isMainsOn && receivedData.power > highPowerThreshold) {
+    alertMsg = "HIGH_POWER:" + String(receivedData.power, 1) + "W";
+    currentAlert = "HIGH_P";
+    shouldAlert = true;
+    buzzerTone = 1600; // Medium-high frequency for high power
+  }
+  
+  // Check for phantom voltage
+  else if (!receivedData.isMainsOn && receivedData.phantomVoltage > phantomThreshold) {
+    alertMsg = "PHANTOM_DETECTED:" + String(receivedData.phantomVoltage, 1) + "V";
+    currentAlert = "PHANTOM";
+    shouldAlert = true;
+    buzzerTone = 1500; // Medium frequency for phantom
+  }
+  
+  // Check for poor power factor
+  else if (receivedData.isMainsOn && receivedData.power > 100 && receivedData.powerFactor < lowPowerFactorThreshold) {
+    alertMsg = "LOW_POWER_FACTOR:" + String(receivedData.powerFactor, 2);
+    currentAlert = "LOW_PF";
+    shouldAlert = true;
+    buzzerTone = 800; // Low-medium frequency for power factor
+  }
+  
+  // Check for data quality issues
+  else if (dataQuality.voltageStability > 5.0 && receivedData.isMainsOn) {
+    alertMsg = "VOLTAGE_UNSTABLE:" + String(dataQuality.voltageStability, 1) + "V";
+    currentAlert = "UNSTBL";
+    shouldAlert = true;
+    buzzerTone = 1200; // Medium frequency for instability
+  }
+  
+  else {
+    currentAlert = "";
+  }
+  
+  buzzerState = shouldAlert && buzzerEnabled;
+  
+  if (shouldAlert) {
+    alertCount++;
+    // Send alert to MQTT
+    if (mqttClient.connected()) {
+      mqttClient.publish(alert_feed, alertMsg.c_str());
+    }
+    Serial.println("ALERT #" + String(alertCount) + ": " + alertMsg);
+  }
+}
+
+void handleBuzzer() {
+  if (buzzerState && buzzerEnabled) {
+    if (millis() - lastBuzzerToggle >= 500) { // Toggle every 500ms
+      tone(BUZZER_PIN, buzzerTone, 200);
+      lastBuzzerToggle = millis();
+    }
+  } else {
+    noTone(BUZZER_PIN);
+  }
+}
+
+void handleModeButton() {
+  static bool lastButtonState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  const unsigned long debounceDelay = 50;
+  
+  bool reading = digitalRead(MODE_BUTTON_PIN);
+  
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading == LOW && lastButtonState == HIGH) {
+      // Button pressed - cycle display mode
+      displayMode = (DisplayMode)((displayMode + 1) % 6);
+      autoDisplayChange = false; // Disable auto mode switching
+      Serial.print("Manual display mode: ");
+      Serial.println(displayMode);
+      lastDisplayChange = millis();
+    }
+  }
+  
+  lastButtonState = reading;
+}
+
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command.startsWith("threshold ")) {
+      String param = command.substring(10);
+      if (param.startsWith("lowv ")) {
+        lowVoltageThreshold = param.substring(5).toFloat();
+        Serial.print("Low voltage threshold set to: ");
+        Serial.println(lowVoltageThreshold);
+      } else if (param.startsWith("highv ")) {
+        highVoltageThreshold = param.substring(6).toFloat();
+        Serial.print("High voltage threshold set to: ");
+        Serial.println(highVoltageThreshold);
+      } else if (param.startsWith("highi ")) {
+        highCurrentThreshold = param.substring(6).toFloat();
+        Serial.print("High current threshold set to: ");
+        Serial.println(highCurrentThreshold);
+      } else if (param.startsWith("highp ")) {
+        highPowerThreshold = param.substring(6).toFloat();
+        Serial.print("High power threshold set to: ");
+        Serial.println(highPowerThreshold);
+      } else if (param.startsWith("phantom ")) {
+        phantomThreshold = param.substring(8).toFloat();
+        Serial.print("Phantom threshold set to: ");
+        Serial.println(phantomThreshold);
+      } else if (param.startsWith("pf ")) {
+        lowPowerFactorThreshold = param.substring(3).toFloat();
+        Serial.print("Low power factor threshold set to: ");
+        Serial.println(lowPowerFactorThreshold);
+      }
+    }
+    else if (command == "buzzer on") {
+      buzzerEnabled = true;
+      Serial.println("Buzzer enabled");
+    }
+    else if (command == "buzzer off") {
+      buzzerEnabled = false;
+      buzzerState = false;
+      noTone(BUZZER_PIN);
+      Serial.println("Buzzer disabled");
+    }
+    else if (command == "auto on") {
+      autoDisplayChange = true;
+      Serial.println("Auto display mode enabled");
+    }
+    else if (command == "auto off") {
+      autoDisplayChange = false;
+      Serial.println("Auto display mode disabled");
+    }
+    else if (command.startsWith("mode ")) {
+      int newMode = command.substring(5).toInt();
+      if (newMode >= 0 && newMode < 6) {
+        displayMode = (DisplayMode)newMode;
+        autoDisplayChange = false;
+        Serial.print("Display mode set to: ");
+        Serial.println(displayMode);
+      } else {
+        Serial.println("Invalid mode. Use 0-5.");
+      }
+    }
+    else if (command == "reset stats") {
+      resetStatistics();
+      Serial.println("Statistics reset");
+    }
+    else if (command == "reset energy") {
+      totalEnergyWh = 0.0;
+      dailyEnergyWh = 0.0;
+      Serial.println("Energy counters reset");
+    }
+    else if (command == "save") {
+      saveSettings();
+      Serial.println("Settings saved to flash");
+    }
+    else if (command == "load") {
+      loadSettings();
+      Serial.println("Settings loaded from flash");
+    }
+    else if (command == "status") {
+      printSystemStatus();
+    }
+    else if (command == "help") {
+      printHelp();
+    }
+    else if (command == "force11") {
+      Serial.println("Forcing Channel 11...");
+      forceChannel11();
+    }
+    else if (command == "diagnostics") {
+      printNetworkDiagnostics();
+    }
+    else if (command.length() > 0) {
+      Serial.println("Unknown command. Type 'help' for available commands.");
+    }
+  }
+}
+
+void printHelp() {
+  Serial.println("Available commands:");
+  Serial.println("threshold lowv XXX    - Set low voltage threshold");
+  Serial.println("threshold highv XXX   - Set high voltage threshold");
+  Serial.println("threshold highi XXX   - Set high current threshold");
+  Serial.println("threshold highp XXX   - Set high power threshold");
+  Serial.println("threshold phantom XXX - Set phantom threshold");
+  Serial.println("threshold pf XXX      - Set power factor threshold");
+  Serial.println("buzzer on/off         - Enable/disable buzzer");
+  Serial.println("auto on/off           - Enable/disable auto display");
+  Serial.println("mode X                - Set display mode (0-5)");
+  Serial.println("reset stats           - Reset statistics");
+  Serial.println("reset energy          - Reset energy counters");
+  Serial.println("save                  - Save settings to flash");
+  Serial.println("load                  - Load settings from flash");
+  Serial.println("status                - Show system status");
+  Serial.println("force11               - Force channel 11");
+  Serial.println("diagnostics           - Run network diagnostics");
+  Serial.println("help                  - Show this help");
+}
+
+void printSystemStatus() {
+  Serial.println("\n=== System Status ===");
+  Serial.print("Data Valid: ");
+  Serial.println(dataValid ? "YES" : "NO");
+  Serial.print("Last Data: ");
+  Serial.print((millis() - lastDataReceived) / 1000);
+  Serial.println(" seconds ago");
+  Serial.print("WiFi: ");
+  Serial.print(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  Serial.print(" (Channel ");
+  Serial.print(WiFi.channel());
+  Serial.print(", RSSI ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(")");
+  Serial.print("MQTT: ");
+  Serial.println(mqttClient.connected() ? "Connected" : "Disconnected");
+  Serial.print("Current Alert: ");
+  Serial.println(currentAlert.length() > 0 ? currentAlert : "None");
+  Serial.print("Total Energy: ");
+  Serial.print(totalEnergyWh, 3);
+  Serial.println(" Wh");
+  Serial.print("Daily Energy: ");
+  Serial.print(dailyEnergyWh, 3);
+  Serial.println(" Wh");
+  
+  Serial.println("\n=== Channel Status ===");
+  uint8_t primary;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&primary, &second);
+  Serial.print("ESP WiFi Channel: ");
+  Serial.println(primary);
+  Serial.print("Arduino WiFi Channel: ");
+  Serial.println(WiFi.channel());
+  Serial.print("Channel Locked: ");
+  Serial.println(channelLocked ? "YES" : "NO");
+  
+  Serial.println("\n=== Statistics ===");
+  Serial.print("Data Points: ");
+  Serial.println(stats.dataPoints);
+  Serial.print("Successful TX: ");
+  Serial.println(stats.successfulTransmissions);
+  Serial.print("Failed TX: ");
+  Serial.println(stats.failedTransmissions);
+  Serial.print("Total Timeouts: ");
+  Serial.println(dataQuality.totalTimeouts);
+  Serial.print("Voltage Range: ");
+  Serial.print(stats.minVoltage, 1);
+  Serial.print("V - ");
+  Serial.print(stats.maxVoltage, 1);
+  Serial.println("V");
+  Serial.print("Max Current: ");
+  Serial.print(stats.maxCurrent * 1000, 1);
+  Serial.println(" mA");
+  Serial.print("Max Power: ");
+  Serial.print(stats.maxPower, 1);
+  Serial.println(" W");
+  Serial.print("Voltage Stability: ");
+  Serial.print(dataQuality.voltageStability, 2);
+  Serial.println(" V");
+  Serial.println("=====================\n");
+}
+
+void saveSettings() {
+  preferences.begin("receiver_cfg", false);
+  preferences.putFloat("lowv_th", lowVoltageThreshold);
+  preferences.putFloat("highv_th", highVoltageThreshold);
+  preferences.putFloat("highi_th", highCurrentThreshold);
+  preferences.putFloat("highp_th", highPowerThreshold);
+  preferences.putFloat("phantom_th", phantomThreshold);
+  preferences.putFloat("pf_th", lowPowerFactorThreshold);
+  preferences.putBool("buzzer_en", buzzerEnabled);
+  preferences.putBool("auto_disp", autoDisplayChange);
+  preferences.putInt("disp_mode", displayMode);
+  preferences.putFloat("total_energy", totalEnergyWh);
+  preferences.end();
+}
+
+void loadSettings() {
+  preferences.begin("receiver_cfg", true); // Read-only
+  lowVoltageThreshold = preferences.getFloat("lowv_th", 200.0);
+  highVoltageThreshold = preferences.getFloat("highv_th", 250.0);
+  highCurrentThreshold = preferences.getFloat("highi_th", 25.0);
+  highPowerThreshold = preferences.getFloat("highp_th", 5000.0);
+  phantomThreshold = preferences.getFloat("phantom_th", 5.0);
+  lowPowerFactorThreshold = preferences.getFloat("pf_th", 0.7);
+  buzzerEnabled = preferences.getBool("buzzer_en", true);
+  autoDisplayChange = preferences.getBool("auto_disp", true);
+  displayMode = (DisplayMode)preferences.getInt("disp_mode", 0);
+  totalEnergyWh = preferences.getFloat("total_energy", 0.0);
+  preferences.end();
+}
+
+void resetStatistics() {
+  stats.maxVoltage = 0.0;
+  stats.minVoltage = 999.0;
+  stats.maxCurrent = 0.0;
+  stats.maxPower = 0.0;
+  stats.avgVoltage = 0.0;
+  stats.avgCurrent = 0.0;
+  stats.avgPower = 0.0;
+  stats.dataPoints = 0;
+  stats.successfulTransmissions = 0;
+  stats.failedTransmissions = 0;
+  stats.lastReset = millis();
+  
+  dataQuality.voltageStability = 0.0;
+  dataQuality.currentStability = 0.0;
+  dataQuality.consecutiveTimeouts = 0;
+  dataQuality.totalTimeouts = 0;
+  dataQuality.averageSignalStrength = 0.0;
+}
+
+// Callback function for ESP-NOW data reception
+void onDataReceived(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(SensorData)) {
+    // Store previous data for comparison
+    lastValidData = receivedData;
+    
+    // Copy new data
+    memcpy(&receivedData, incomingData, sizeof(receivedData));
+    newDataReceived = true;
+    dataValid = true;
+    lastDataReceived = millis();
+    dataQuality.consecutiveTimeouts = 0; // Reset timeout counter
+    
+    // Update statistics
+    updateStatistics();
+    
+    // Print detailed received data
+    Serial.print("Data received from: ");
+    for (int i = 0; i < 6; i++) {
+      Serial.printf("%02X", recv_info->src_addr[i]);
+      if (i < 5) Serial.print(":");
+    }
+    Serial.print(" | V: ");
+    Serial.print(receivedData.liveVoltage, 1);
+    Serial.print("V, I: ");
+    Serial.print(receivedData.current, 3);
+    Serial.print("A, P: ");
+    Serial.print(receivedData.power, 1);
+    Serial.print("W, PF: ");
+    Serial.print(receivedData.powerFactor, 2);
+    Serial.print(" | RSSI: ");
+    Serial.println(receivedData.signalStrength);
+    
+    stats.successfulTransmissions++;
+  } else {
+    Serial.print("Invalid data size received: ");
+    Serial.print(len);
+    Serial.print(" bytes, expected: ");
+    Serial.println(sizeof(SensorData));
+    stats.failedTransmissions++;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== Enhanced Voltage & Current Monitor Receiver ===");
+  
+  // Initialize preferences and load settings
+  loadSettings();
+  
+  // Initialize pins
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
+  
+  // Initialize I2C and LCD
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Enhanced V & I");
+  lcd.setCursor(0, 1);
+  lcd.print("Monitor Receiver");
+  lcd.setCursor(0, 2);
+  lcd.print("Version 2.1");
+  delay(3000);
+  
+  // Print MAC address first
+  WiFi.mode(WIFI_STA);
+  Serial.print("Receiver MAC Address: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("Set this MAC in your sender code!");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Receiver MAC:");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.macAddress().substring(0, 16));
+  lcd.setCursor(0, 2);
+  lcd.print("Set this in sender");
+  lcd.setCursor(0, 3);
+  lcd.print("Check Serial Mon");
+  delay(5000);
+  
+  // CRITICAL: Force channel 11 BEFORE initializing ESP-NOW
+  forceChannel11();
+  
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ESP-NOW Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Reboot required");
+    while (1) {
+      delay(1000);
+    }
+  }
+  
+  // Register receive callback
+  esp_now_register_recv_cb(onDataReceived);
+  Serial.println("ESP-NOW initialized on Channel 11");
+  
+  // Now connect to WiFi while maintaining channel 11
+  connectToWiFiWithChannelLock();
+  
+  // Setup MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  
+  Serial.println("Receiver initialized successfully");
+  Serial.print("Operating on WiFi Channel: ");
+  Serial.println(WiFi.channel());
+  Serial.println("\n=== Serial Commands Available ===");
+  printHelp();
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  lcd.setCursor(0, 1);
+  lcd.print("Channel: ");
+  lcd.print(WiFi.channel());
+  lcd.setCursor(0, 2);
+  lcd.print("Waiting for data");
+  delay(2000);
+  
+  // Initialize energy tracking
+  lastEnergyUpdate = millis();
+  dayStartTime = millis();
+  stats.lastReset = millis();
+  
+  // Final channel verification
+  if (WiFi.channel() != 11) {
+    Serial.println("WARNING: Final channel is not 11!");
+    forceChannel11();
+  }
+}
+
+void forceChannel11() {
+  Serial.println("\n=== FORCING CHANNEL 11 ===");
+  
+  // Complete WiFi shutdown
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  
+  // Start in STA mode
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(500);
+  
+  // Multiple attempts to force channel 11
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    Serial.print("Attempt ");
+    Serial.print(attempt);
+    Serial.print(" to force Channel 11... ");
+    
+    // Force channel using esp_wifi_set_channel
+    esp_err_t result = esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    delay(1000);
+    
+    // Verify channel
+    uint8_t primary;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&primary, &second);
+    
+    Serial.print("Result: ");
+    if (result == ESP_OK) {
+      Serial.print("OK, ");
+    } else {
+      Serial.print("FAILED, ");
+    }
+    Serial.print("Channel: ");
+    Serial.println(primary);
+    
+    if (primary == 11) {
+      Serial.println("SUCCESS: Channel 11 locked!");
+      wifiChannel = 11;
+      channelLocked = true;
+      break;
+    }
+    
+    delay(500);
+  }
+  
+  // If still not on channel 11, try alternative method
+  if (WiFi.channel() != 11) {
+    Serial.println("Using alternative channel forcing method...");
+    
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+    
+    // Set WiFi config manually
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_start();
+    
+    delay(1000);
+    
+    // Verify final channel
+    uint8_t finalChannel;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&finalChannel, &second);
+    
+    Serial.print("Final forced channel: ");
+    Serial.println(finalChannel);
+    
+    if (finalChannel == 11) {
+      Serial.println("SUCCESS: Alternative method worked!");
+      wifiChannel = 11;
+      channelLocked = true;
+    } else {
+      Serial.println("CRITICAL: Cannot force Channel 11!");
+    }
+  }
+  
+  Serial.println("=== CHANNEL FORCING COMPLETE ===\n");
+}
+
+void connectToWiFiWithChannelLock() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  lcd.setCursor(0, 1);
+  lcd.print(ssid);
+  
+  Serial.println("\n=== WiFi Connection with Channel 11 Lock ===");
+  
+  // Ensure we're in AP_STA mode for ESP-NOW + WiFi
+  WiFi.mode(WIFI_AP_STA);
+  delay(1000);
+  
+  // Force channel 11 again
+  esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+  delay(500);
+  
+  // Scan for networks
+  Serial.println("Scanning for networks...");
+  int networks = WiFi.scanNetworks(false, true);
+  
+  bool targetFound = false;
+  int targetChannel = 11;
+  
+  for (int i = 0; i < networks; i++) {
+    Serial.print("Network: ");
+    Serial.print(WiFi.SSID(i));
+    Serial.print(" Ch:");
+    Serial.print(WiFi.channel(i));
+    Serial.print(" RSSI:");
+    Serial.println(WiFi.RSSI(i));
+    
+    if (WiFi.SSID(i) == ssid) {
+      targetFound = true;
+      targetChannel = WiFi.channel(i);
+      Serial.print("*** TARGET FOUND on Channel ");
+      Serial.println(targetChannel);
+      
+      if (targetChannel != 11) {
+        Serial.println("WARNING: Target network is NOT on Channel 11!");
+        Serial.println("ESP-NOW communication may not work properly!");
+        Serial.println("Please change your hotspot to Channel 11");
+        
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("WRONG CHANNEL!");
+        lcd.setCursor(0, 1);
+        lcd.print("Hotspot Ch:");
+        lcd.print(targetChannel);
+        lcd.setCursor(0, 2);
+        lcd.print("Need Ch:11");
+        lcd.setCursor(0, 3);
+        lcd.print("Fix hotspot!");
+        delay(5000);
+      }
+    }
+  }
+  
+  if (!targetFound) {
+    Serial.println("Target network not found!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Network not found");
+    lcd.setCursor(0, 1);
+    lcd.print("Check hotspot");
+    
+    // Still maintain channel 11 for ESP-NOW
+    esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    delay(3000);
+    return;
+  }
+  
+  // Multiple connection attempts with channel forcing
+  for (int connAttempt = 1; connAttempt <= 3; connAttempt++) {
+    Serial.print("Connection attempt ");
+    Serial.print(connAttempt);
+    Serial.println("/3");
+    
+    // Force channel 11 before each attempt
+    esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    delay(1000);
+    
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+      
+      if (attempts % 10 == 0) {
+        Serial.print(" [");
+        Serial.print(attempts);
+        Serial.print("/30] ");
+        
+        // Re-force channel 11 every 10 attempts
+        esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+      }
+      
+      lcd.setCursor(0, 2);
+      lcd.print("Attempt: ");
+      lcd.print(attempts);
+      lcd.print("/30");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      break;
+    } else {
+      Serial.println(" FAILED");
+      WiFi.disconnect();
+      delay(2000);
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    
+    int actualChannel = WiFi.channel();
+    Serial.print("WiFi Channel: ");
+    Serial.println(actualChannel);
+    
+    if (actualChannel != 11) {
+      Serial.println("*** CRITICAL: WiFi connected on wrong channel! ***");
+      Serial.println("Forcing back to Channel 11...");
+      
+      // Try to force back to channel 11
+      for (int i = 0; i < 3; i++) {
+        esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+        delay(1000);
+        if (WiFi.channel() == 11) {
+          Serial.println("Successfully restored Channel 11!");
+          break;
+        }
+      }
+      
+      if (WiFi.channel() != 11) {
+        Serial.println("FAILED to restore Channel 11!");
+        Serial.println("ESP-NOW may not work properly!");
+      }
+    }
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected!");
+    lcd.setCursor(0, 1);
+    lcd.print("Ch:");
+    lcd.print(WiFi.channel());
+    if (WiFi.channel() == 11) {
+      lcd.print(" - CORRECT");
+    } else {
+      lcd.print(" - WRONG!");
+    }
+    lcd.setCursor(0, 2);
+    lcd.print("IP:");
+    lcd.print(WiFi.localIP().toString().substring(0, 12));
+    
+    // Run network diagnostics
+    printNetworkDiagnostics();
+    
+  } else {
+    Serial.println("WiFi connection failed!");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("ESP-NOW only");
+    
+    // Ensure ESP-NOW still works on channel 11
+    esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+  }
+  
+  delay(3000);
+  Serial.println("=== WiFi Setup Complete ===\n");
+}
+
+void reconnectWiFiSameChannel() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  Serial.println("Reconnecting WiFi on same channel...");
+  
+  // Force channel 11 first
+  esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+  delay(500);
+  
+  WiFi.disconnect();
+  delay(1000);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+    
+    if (attempts % 5 == 0) {
+      // Re-force channel 11
+      esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi reconnected!");
+    if (WiFi.channel() != 11) {
+      Serial.println("WARNING: Reconnected on wrong channel!");
+      esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    }
+  } else {
+    Serial.println("WiFi reconnection failed");
+  }
+}
+
+void printNetworkDiagnostics() {
+  Serial.println("\n=== Network Diagnostics ===");
+  Serial.print("WiFi Status: ");
+  switch (WiFi.status()) {
+    case WL_CONNECTED: Serial.println("Connected"); break;
+    case WL_NO_SHIELD: Serial.println("No Shield"); break;
+    case WL_IDLE_STATUS: Serial.println("Idle"); break;
+    case WL_NO_SSID_AVAIL: Serial.println("No SSID Available"); break;
+    case WL_SCAN_COMPLETED: Serial.println("Scan Completed"); break;
+    case WL_CONNECT_FAILED: Serial.println("Connection Failed"); break;
+    case WL_CONNECTION_LOST: Serial.println("Connection Lost"); break;
+    case WL_DISCONNECTED: Serial.println("Disconnected"); break;
+    default: Serial.println("Unknown"); break;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("Subnet Mask: ");
+    Serial.println(WiFi.subnetMask());
+    Serial.print("DNS: ");
+    Serial.println(WiFi.dnsIP());
+    
+    // Signal quality
+    int rssi = WiFi.RSSI();
+    Serial.print("Signal Strength: ");
+    Serial.print(rssi);
+    Serial.print(" dBm (");
+    if (rssi > -50) Serial.print("Excellent");
+    else if (rssi > -60) Serial.print("Good");
+    else if (rssi > -70) Serial.print("Fair");
+    else Serial.print("Poor");
+    Serial.println(")");
+  }
+  
+  // Channel verification
+  uint8_t primary;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&primary, &second);
+  Serial.print("Current Channel: ");
+  Serial.println(primary);
+  
+  if (primary != 11) {
+    Serial.println("*** CHANNEL MISMATCH DETECTED ***");
+  } else {
+    Serial.println("Channel 11 - CORRECT for ESP-NOW");
+  }
+  
+  Serial.println("=== Diagnostics Complete ===\n");
+}
+
+void loop() {
+  // Handle serial commands
+  handleSerialCommands();
+  
+  // Check manual mode button
+  handleModeButton();
+  
+  // Verify channel 11 every 30 seconds
+  static unsigned long lastChannelCheck = 0;
+  if (millis() - lastChannelCheck > 30000) {
+    if (WiFi.channel() != 11) {
+      Serial.println("Channel drift detected! Forcing back to 11...");
+      esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    }
+    lastChannelCheck = millis();
+  }
+  
+  // Check WiFi status and reconnect if needed
+  if (WiFi.status() != WL_CONNECTED && millis() > 60000) { // Wait 1 minute after boot
+    static unsigned long lastReconnectAttempt = 0;
+    if (millis() - lastReconnectAttempt > 30000) { // Try every 30 seconds
+      Serial.println("WiFi disconnected, attempting reconnection...");
+      reconnectWiFiSameChannel();
+      lastReconnectAttempt = millis();
+    }
+  }
+  
+  // Check for data timeout
+  if (dataValid && (millis() - lastDataReceived > DATA_TIMEOUT)) {
+    dataValid = false;
+    dataQuality.consecutiveTimeouts++;
+    dataQuality.totalTimeouts++;
+    Serial.println("WARNING: Data timeout - no signal from sender");
+  }
+  
+  // Process new data if received
+  if (newDataReceived && dataValid) {
+    newDataReceived = false;
+    
+    // Update energy calculation
+    updateEnergy();
+    
+    // Check for alerts
+    checkAlerts();
+    
+    // Update data quality metrics
+    updateDataQuality();
+  }
+  
+  // Send data to MQTT periodically
+  if (millis() - lastMqttSend >= MQTT_SEND_INTERVAL && dataValid) {
+    sendToMQTT();
+    lastMqttSend = millis();
+  }
+  
+  // Handle MQTT connection
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+  
+  // Handle buzzer alerts
+  handleBuzzer();
+  
+  // Update LCD with rotating display or manual mode
+  if (autoDisplayChange && (millis() - lastDisplayChange > DISPLAY_CHANGE_INTERVAL)) {
+    displayMode = (DisplayMode)((displayMode + 1) % 6);
+    lastDisplayChange = millis();
+  }
+  updateLCD();
+  
+  // Reset daily energy at midnight (24 hours)
+  if (millis() - dayStartTime > DAY_RESET_INTERVAL) {
+    dailyEnergyWh = 0.0;
+    dayStartTime = millis();
+    Serial.println("Daily energy counter reset");
+  }
+  
+  // Periodic status update
+  if (millis() - lastStatusUpdate > STATUS_UPDATE_INTERVAL) {
+    lastStatusUpdate = millis();
+    
+    // Debug output every 30 seconds
+    static unsigned long lastDebugOutput = 0;
+    if (millis() - lastDebugOutput > 30000) {
+      printSystemStatus();
+      lastDebugOutput = millis();
+    }
+  }
+  
+  delay(50); // Reduced delay for more responsive system
+}
+
+void updateStatistics() {
+  if (!dataValid) return;
+  
+  stats.dataPoints++;
+  
+  // Update min/max values
+  if (receivedData.liveVoltage > stats.maxVoltage) stats.maxVoltage = receivedData.liveVoltage;
+  if (receivedData.liveVoltage < stats.minVoltage && receivedData.liveVoltage > 10) stats.minVoltage = receivedData.liveVoltage;
+  if (receivedData.current > stats.maxCurrent) stats.maxCurrent = receivedData.current;
+  if (receivedData.power > stats.maxPower) stats.maxPower = receivedData.power;
+  
+  // Update running averages
+  stats.avgVoltage = ((stats.avgVoltage * (stats.dataPoints - 1)) + receivedData.liveVoltage) / stats.dataPoints;
+  stats.avgCurrent = ((stats.avgCurrent * (stats.dataPoints - 1)) + receivedData.current) / stats.dataPoints;
+  stats.avgPower = ((stats.avgPower * (stats.dataPoints - 1)) + receivedData.power) / stats.dataPoints;
+  
+  // Update signal strength average
+  dataQuality.averageSignalStrength = ((dataQuality.averageSignalStrength * (stats.dataPoints - 1)) + receivedData.signalStrength) / stats.dataPoints;
+}
+
+void updateDataQuality() {
+  // Calculate voltage stability (standard deviation over recent readings)
+  static float voltageHistory[10];
+  static int voltageIndex = 0;
+  static bool historyFilled = false;
+  
+  voltageHistory[voltageIndex] = receivedData.liveVoltage;
+  voltageIndex = (voltageIndex + 1) % 10;
+  if (voltageIndex == 0) historyFilled = true;
+  
+  if (historyFilled) {
+    float avgVolt = 0;
+    for (int i = 0; i < 10; i++) avgVolt += voltageHistory[i];
+    avgVolt /= 10;
+    
+    float variance = 0;
+    for (int i = 0; i < 10; i++) {
+      float diff = voltageHistory[i] - avgVolt;
+      variance += diff * diff;
+    }
+    dataQuality.voltageStability = sqrt(variance / 10);
+  }
+}
+
+void reconnectMQTT() {
+  static unsigned long lastAttempt = 0;
+  if (millis() - lastAttempt < 5000) return;
+  
+  Serial.print("Connecting to MQTT...");
+  
+  String clientId = "ESP32VoltCurrentRx_" + WiFi.macAddress();
+  clientId.replace(":", "");
+  
+  if (mqttClient.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+    Serial.println(" connected");
+  } else {
+    Serial.print(" failed, rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(" trying again in 5 seconds");
+  }
+  
+  lastAttempt = millis();
+}
+
+void updateEnergy() {
+  if (millis() - lastEnergyUpdate >= ENERGY_UPDATE_INTERVAL) {
+    if (receivedData.power > 0) {
+      // Calculate energy consumed in the last interval (Wh = W * hours)
+      float intervalHours = (float)(millis() - lastEnergyUpdate) / 3600000.0;
+      float energyIncrement = receivedData.power * intervalHours;
+      
+      totalEnergyWh += energyIncrement;
+      dailyEnergyWh += energyIncrement;
+      
+      Serial.print("Energy update: +");
+      Serial.print(energyIncrement, 4);
+      Serial.print("Wh, Total: ");
+      Serial.print(totalEnergyWh, 2);
+      Serial.println("Wh");
+    }
+    lastEnergyUpdate = millis();
+  }
+}

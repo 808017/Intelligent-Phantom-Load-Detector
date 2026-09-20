@@ -1,0 +1,1154 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_ADS1X15.h>
+#include <esp_wifi.h>
+#include <Preferences.h>
+
+// Receiver ESP32 MAC Address - Replace with your receiver's MAC
+uint8_t receiverMAC[] = {0x44, 0x1D, 0x64, 0xF2, 0x09, 0x18};
+
+// WiFi Channel Configuration
+int targetChannel = 11;
+
+// Pin definitions for encoder
+#define ENCODER_CLK 19
+#define ENCODER_DT 18
+#define ENCODER_SW 5
+
+// Buzzer pin definition (LOW level trigger module MH-FMD)
+#define BUZZER_PIN 4
+
+// ADS1115 Channel definitions
+#define VOLTAGE_CHANNEL 2
+#define CURRENT_DIFF_0 0
+#define CURRENT_DIFF_1 1
+
+// Initialize components
+LiquidCrystal_I2C lcd(0x27, 16, 4);
+Adafruit_ADS1115 ads;
+Preferences preferences;
+
+// Buzzer tone definitions (in Hz)
+#define TONE_ENCODER_ROTATE 2000
+#define TONE_BUTTON_PRESS 2500
+#define TONE_MODE_CHANGE 3000
+#define TONE_SAVE_SUCCESS 2800
+#define TONE_WARNING 1500
+#define TONE_ERROR 800
+
+// Buzzer volume control (0-255)
+uint8_t buzzerVolume = 200;
+
+// Buzzer timing
+#define BEEP_SHORT 50
+#define BEEP_MEDIUM 100
+#define BEEP_LONG 200
+
+// Voltage measurement variables
+float voltage = 0.0;
+float phantomVoltage = 0.0;
+const int VOLTAGE_SAMPLES = 1000;
+const float VOLTAGE_REF = 3.3;
+const float ADS_MAX_VALUE = 32767.0;
+const float DC_OFFSET = 1.65;
+const int VOLTAGE_SAMPLE_DELAY_US = 100;
+
+// Voltage calibration variables
+float voltageCalibrationMultiplier = 565.0;
+float voltageNoiseThreshold = 0.12;
+bool voltageDebugMode = false;
+
+// Current measurement variables
+float current = 0.0;
+float power = 0.0;
+const int CURRENT_SAMPLES = 500;
+const float ADS_LSB = 7.8125e-6;
+const float CURRENT_CALIBRATION = 30.0 / 0.64;
+const float CURRENT_NOISE_THRESHOLD = 0.005;
+
+// Measurement timing
+unsigned long lastReading = 0;
+const unsigned long READING_INTERVAL = 500;
+
+// Encoder variables
+volatile int encoderPos = 0;
+volatile bool encoderChanged = false;
+volatile bool buttonPressed = false;
+int lastEncoderPos = 0;
+uint8_t lastEncoderState = 0;
+
+// Button debouncing
+unsigned long lastButtonPressTime = 0;
+const unsigned long BUTTON_DEBOUNCE = 250;
+
+// Current threshold instead of phantom threshold (in Amperes)
+float currentThreshold = 0.1; // Default 100mA threshold
+const float CURRENT_THRESHOLD_STEP = 0.01; // 10mA steps
+const float MIN_CURRENT_THRESHOLD = 0.01; // 10mA minimum
+const float MAX_CURRENT_THRESHOLD = 5.0; // 5A maximum
+
+// Operating modes
+enum OperatingMode {
+  NORMAL_MODE,
+  THRESHOLD_SETTING_MODE,
+  CALIBRATION_MODE,
+  VOLTAGE_CALIBRATION_MODE,
+  CHANNEL_SETTING_MODE
+};
+
+OperatingMode currentMode = NORMAL_MODE;
+OperatingMode lastMode = NORMAL_MODE;
+unsigned long modeChangeTime = 0;
+const unsigned long MODE_TIMEOUT = 15000;
+
+// Channel setting variables
+int newChannel = 11;
+const int MIN_CHANNEL = 1;
+const int MAX_CHANNEL = 14;
+
+// Data structure to send
+typedef struct {
+  float liveVoltage;
+  float phantomVoltage;
+  float current;
+  float power;
+  float powerFactor;
+  unsigned long timestamp;
+  bool isMainsOn;
+  int signalStrength;
+} SensorData;
+
+SensorData data;
+
+// Communication statistics
+int sendAttempts = 0;
+unsigned long lastSendTime = 0;
+esp_err_t lastSendResult = ESP_OK;
+
+// Voltage stability tracking
+float voltageReadings[10];
+int voltageIndex = 0;
+float avgVoltage = 0.0;
+float voltageStdDev = 0.0;
+
+// ============================================
+// BUZZER FUNCTIONS
+// ============================================
+
+void playTone(int frequency, int duration) {
+  if (buzzerVolume == 0) return;
+  
+  int periodMicros = 1000000 / frequency;
+  int halfPeriod = periodMicros / 2;
+  int onTimeMicros = (halfPeriod * buzzerVolume) / 255;
+  
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < duration) {
+    digitalWrite(BUZZER_PIN, LOW);
+    delayMicroseconds(onTimeMicros);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(halfPeriod - onTimeMicros);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(halfPeriod);
+  }
+  
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void beepEncoderRotate() {
+  playTone(TONE_ENCODER_ROTATE, BEEP_SHORT);
+}
+
+void beepButtonPress() {
+  playTone(TONE_BUTTON_PRESS, BEEP_MEDIUM);
+}
+
+void beepModeChange() {
+  playTone(TONE_MODE_CHANGE, BEEP_MEDIUM);
+  delay(50);
+  playTone(TONE_MODE_CHANGE, BEEP_SHORT);
+}
+
+void beepSaveSuccess() {
+  playTone(TONE_SAVE_SUCCESS, BEEP_MEDIUM);
+  delay(50);
+  playTone(TONE_SAVE_SUCCESS, BEEP_SHORT);
+  delay(50);
+  playTone(TONE_SAVE_SUCCESS, BEEP_SHORT);
+}
+
+void beepWarning() {
+  playTone(TONE_WARNING, BEEP_LONG);
+}
+
+void beepError() {
+  playTone(TONE_ERROR, BEEP_LONG);
+  delay(100);
+  playTone(TONE_ERROR, BEEP_LONG);
+}
+
+// ============================================
+// ENCODER INTERRUPT HANDLERS
+// ============================================
+
+void IRAM_ATTR encoderISR() {
+  uint8_t clkState = digitalRead(ENCODER_CLK);
+  uint8_t dtState = digitalRead(ENCODER_DT);
+  uint8_t currentState = (clkState << 1) | dtState;
+  
+  static uint8_t prevState = 0;
+  
+  if (prevState == 0b00 && currentState == 0b10) {
+    encoderPos++;
+    encoderChanged = true;
+  } else if (prevState == 0b00 && currentState == 0b01) {
+    encoderPos--;
+    encoderChanged = true;
+  }
+  
+  prevState = currentState;
+  lastEncoderState = currentState;
+}
+
+void IRAM_ATTR buttonISR() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastButtonPressTime > BUTTON_DEBOUNCE) {
+    buttonPressed = true;
+    lastButtonPressTime = currentTime;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== ESP32 Voltage & Current Monitor Sender (Enhanced) ===");
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, HIGH);
+  
+  delay(100);
+  beepModeChange();
+  
+  preferences.begin("voltage_cal", false);
+  
+  voltageCalibrationMultiplier = preferences.getFloat("vol_cal_mult", 563.0);
+  voltageNoiseThreshold = preferences.getFloat("vol_noise_th", 0.12);
+  voltageDebugMode = preferences.getBool("vol_debug", false);
+  buzzerVolume = preferences.getUChar("buzzer_vol", 128);
+  currentThreshold = preferences.getFloat("cur_thresh", 0.1);
+  
+  Serial.println("Loaded Settings:");
+  Serial.print("- Voltage Calibration Multiplier: ");
+  Serial.println(voltageCalibrationMultiplier, 2);
+  Serial.print("- Voltage Noise Threshold: ");
+  Serial.println(voltageNoiseThreshold, 4);
+  Serial.print("- Current Threshold: ");
+  Serial.print(currentThreshold * 1000, 0);
+  Serial.println("mA");
+  Serial.print("- Voltage Debug Mode: ");
+  Serial.println(voltageDebugMode ? "ON" : "OFF");
+  Serial.print("- Buzzer Volume: ");
+  Serial.print(buzzerVolume);
+  Serial.println(" (0-255)");
+  Serial.println();
+  
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  
+  uint8_t initialClk = digitalRead(ENCODER_CLK);
+  uint8_t initialDt = digitalRead(ENCODER_DT);
+  lastEncoderState = (initialClk << 1) | initialDt;
+  
+  newChannel = targetChannel;
+  
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_SW), buttonISR, FALLING);
+  
+  for (int i = 0; i < 10; i++) {
+    voltageReadings[i] = 0.0;
+  }
+  
+  Wire.begin(21, 22);
+  
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Voltage & Current");
+  lcd.setCursor(0, 1);
+  lcd.print("Monitor Sender");
+  lcd.setCursor(0, 2);
+  lcd.print("Initializing...");
+  delay(2000);
+  
+  if (!ads.begin()) {
+    Serial.println("Failed to initialize ADS1115!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ADS1115 Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check I2C wiring");
+    beepError();
+    while (1) {
+      delay(1000);
+    }
+  }
+  
+  Serial.println("ADS1115 initialized successfully");
+  beepSaveSuccess();
+  
+  ads.setGain(GAIN_ONE);
+  ads.setDataRate(RATE_ADS1115_860SPS);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  
+  Serial.print("Setting WiFi channel to: ");
+  Serial.println(targetChannel);
+  
+  esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+  
+  delay(50);
+  int actualChannel = WiFi.channel();
+  Serial.print("Actual WiFi channel: ");
+  Serial.println(actualChannel);
+  
+  if (actualChannel != targetChannel) {
+    Serial.println("WARNING: Channel setting may have failed!");
+    beepWarning();
+  }
+  
+  Serial.print("Sender MAC Address: ");
+  Serial.println(WiFi.macAddress());
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sender MAC:");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.macAddress().substring(0, 16));
+  lcd.setCursor(0, 2);
+  lcd.print("Channel: ");
+  lcd.print(actualChannel);
+  lcd.setCursor(0, 3);
+  lcd.print("Target Ch: ");
+  lcd.print(targetChannel);
+  delay(3000);
+  
+  Serial.println("Initializing ESP-NOW...");
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ESP-NOW Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Initialization");
+    lcd.setCursor(0, 2);
+    lcd.print("failed!");
+    beepError();
+    while (1) {
+      delay(1000);
+    }
+  }
+  
+  Serial.println("ESP-NOW initialized successfully");
+  
+  Serial.println("Adding receiver peer...");
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = targetChannel;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  
+  Serial.print("Adding peer with MAC: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X", receiverMAC[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.print(" on channel ");
+  Serial.println(targetChannel);
+  
+  esp_err_t addPeerResult = esp_now_add_peer(&peerInfo);
+  if (addPeerResult != ESP_OK) {
+    Serial.print("Failed to add receiver peer. Error code: ");
+    Serial.println(addPeerResult);
+    beepWarning();
+    delay(5000);
+    Serial.println("Continuing anyway - will retry in loop");
+  } else {
+    Serial.println("Receiver peer added successfully!");
+    beepSaveSuccess();
+  }
+  
+  Serial.println("Sender initialized successfully");
+  Serial.println("Starting voltage and current monitoring...");
+  printHelp();
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  lcd.setCursor(0, 1);
+  lcd.print("Monitoring V & I");
+  delay(1000);
+}
+
+void loop() {
+  handleSerialCommands();
+  handleEncoderImproved();
+  
+  if (currentMode != NORMAL_MODE && 
+      millis() - modeChangeTime > MODE_TIMEOUT) {
+    currentMode = NORMAL_MODE;
+    Serial.println("Mode timeout - returned to normal mode");
+    beepWarning();
+  }
+  
+  if (millis() - lastReading >= READING_INTERVAL) {
+    readVoltageAndCurrent();
+    calculatePower();
+    updateVoltageStability();
+    
+    data.liveVoltage = voltage;
+    data.phantomVoltage = phantomVoltage;
+    data.current = current;
+    data.power = power;
+    data.powerFactor = (voltage > 10 && current > 0.1) ? (power / (voltage * current)) : 0.0;
+    data.timestamp = millis();
+    data.isMainsOn = (voltage > 50.0);
+    data.signalStrength = WiFi.RSSI();
+    
+    Serial.print("Sending: V=");
+    Serial.print(data.liveVoltage, 1);
+    Serial.print("V, I=");
+    Serial.print(data.current, 2);
+    Serial.print("A, P=");
+    Serial.print(data.power, 1);
+    Serial.print("W, PF=");
+    Serial.print(data.powerFactor, 2);
+    Serial.print("... ");
+    
+    sendAttempts++;
+    lastSendTime = millis();
+    lastSendResult = esp_now_send(receiverMAC, (uint8_t *) &data, sizeof(data));
+    
+    if (lastSendResult == ESP_OK) {
+      Serial.println("Send initiated successfully");
+    } else {
+      Serial.print("Send failed with error: ");
+      Serial.println(lastSendResult);
+    }
+    
+    updateLCD();
+    
+    lastReading = millis();
+  }
+  
+  static unsigned long lastChannelCheck = 0;
+  if (millis() - lastChannelCheck > 30000) {
+    int currentChannel = WiFi.channel();
+    if (currentChannel != targetChannel) {
+      Serial.print("WARNING: Channel drift! Current: ");
+      Serial.print(currentChannel);
+      Serial.print(", Expected: ");
+      Serial.println(targetChannel);
+      beepWarning();
+      
+      esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+    }
+    lastChannelCheck = millis();
+  }
+}
+
+float readRMSVoltage() {
+  float sum = 0.0;
+  float voltageVal = 0.0;
+  int16_t adcValue = 0;
+  float maxVoltage = -999.0;
+  float minVoltage = 999.0;
+  float rawSum = 0.0;
+  
+  ads.setGain(GAIN_ONE);
+  delay(2);
+  
+  for (int i = 0; i < VOLTAGE_SAMPLES; i++) {
+    adcValue = ads.readADC_SingleEnded(VOLTAGE_CHANNEL);
+    voltageVal = (adcValue * VOLTAGE_REF) / ADS_MAX_VALUE;
+    rawSum += voltageVal;
+    voltageVal = voltageVal - DC_OFFSET;
+    
+    if (voltageVal > maxVoltage) maxVoltage = voltageVal;
+    if (voltageVal < minVoltage) minVoltage = voltageVal;
+    
+    sum += voltageVal * voltageVal;
+    delayMicroseconds(VOLTAGE_SAMPLE_DELAY_US);
+  }
+  
+  float avgRawVoltage = rawSum / VOLTAGE_SAMPLES;
+  float rmsVoltage = sqrt(sum / VOLTAGE_SAMPLES);
+  float peakToPeak = maxVoltage - minVoltage;
+  
+  if (voltageDebugMode) {
+    Serial.println("--- Voltage Debug Info ---");
+    Serial.print("Raw ADC Average: ");
+    Serial.print(avgRawVoltage, 4);
+    Serial.println("V");
+    Serial.print("Peak-to-Peak: ");
+    Serial.print(peakToPeak, 4);
+    Serial.println("V");
+    Serial.print("RMS (before scaling): ");
+    Serial.print(rmsVoltage, 4);
+    Serial.println("V");
+    Serial.print("Voltage Noise Threshold: ");
+    Serial.print(voltageNoiseThreshold, 4);
+    Serial.println("V");
+    Serial.print("Voltage Calibration Multiplier: ");
+    Serial.println(voltageCalibrationMultiplier, 2);
+  }
+  
+  if (peakToPeak < voltageNoiseThreshold) {
+    if (voltageDebugMode) {
+      Serial.println("Voltage signal below noise threshold - returning 0V");
+    }
+    return 0.0;
+  }
+  
+  rmsVoltage = rmsVoltage * voltageCalibrationMultiplier;
+  
+  if (rmsVoltage < 5.0) {
+    if (voltageDebugMode) {
+      Serial.println("Final voltage too low - returning 0V");
+    }
+    return 0.0;
+  }
+  
+  return rmsVoltage;
+}
+
+void readVoltageAndCurrent() {
+  voltage = readRMSVoltage();
+  
+  ads.setGain(GAIN_SIXTEEN);
+  delay(2);
+  
+  double currentSumSq = 0.0;
+  
+  for (int i = 0; i < CURRENT_SAMPLES; i++) {
+    int16_t currentRaw = ads.readADC_Differential_0_1();
+    double currentVolts = currentRaw * ADS_LSB;
+    currentSumSq += currentVolts * currentVolts;
+  }
+  
+  double currentVrms = sqrt(currentSumSq / CURRENT_SAMPLES);
+  double currentIrms = currentVrms * CURRENT_CALIBRATION;
+  
+  current = (float)currentIrms;
+  
+  static unsigned long lastCurrentDebug = 0;
+  if (millis() - lastCurrentDebug > 3000) {
+    Serial.print("[DEBUG] Voltage=");
+    Serial.print(voltage, 1);
+    Serial.print("V, Current Vrms=");
+    Serial.print(currentVrms * 1000, 2);
+    Serial.print("mV, I=");
+    Serial.print(current * 1000, 1);
+    Serial.println("mA");
+    lastCurrentDebug = millis();
+  }
+  
+  if (current < CURRENT_NOISE_THRESHOLD) {
+    current = 0.0;
+  }
+  
+  if (current > 30.0) {
+    current = 30.0;
+    Serial.println("WARNING: Current capped at 30A");
+    beepWarning();
+  }
+  
+  if (voltage < 30.0 && current > currentThreshold) {
+    phantomVoltage = current * 220.0;
+    current = 0.0;
+  } else {
+    phantomVoltage = 0.0;
+  }
+}
+
+void calculatePower() {
+  if (voltage > 10 && current > 0.005) {
+    power = voltage * current;
+    
+    if (current < 0.1) {
+      power = voltage * current * 0.98;
+    } else {
+      power = voltage * current * 0.90;
+    }
+  } else {
+    power = 0.0;
+  }
+  
+  if (power > 7000) {
+    power = 0.0;
+    current = 0.0;
+    Serial.println("WARNING: Unrealistic power reading detected");
+    beepError();
+  }
+  
+  if (current > 0.005) {
+    Serial.print("[POWER DEBUG] V=");
+    Serial.print(voltage, 1);
+    Serial.print("V, I=");
+    Serial.print(current * 1000, 1);
+    Serial.print("mA, P=");
+    Serial.print(power, 2);
+    Serial.println("W");
+  }
+}
+
+void updateVoltageStability() {
+  voltageReadings[voltageIndex] = voltage;
+  voltageIndex = (voltageIndex + 1) % 10;
+  
+  float sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += voltageReadings[i];
+  }
+  avgVoltage = sum / 10.0;
+  
+  float variance = 0;
+  for (int i = 0; i < 10; i++) {
+    float diff = voltageReadings[i] - avgVoltage;
+    variance += diff * diff;
+  }
+  voltageStdDev = sqrt(variance / 10.0);
+}
+
+void updateLCD() {
+  lcd.clear();
+  
+  if (currentMode == THRESHOLD_SETTING_MODE) {
+    lcd.setCursor(0, 0);
+    lcd.print("CURRENT THRESHOLD");
+    lcd.setCursor(0, 1);
+    lcd.print("Value: ");
+    lcd.print((int)(currentThreshold * 1000));
+    lcd.print("mA    ");
+    lcd.setCursor(0, 2);
+    lcd.print("Rotate: Adjust");
+    lcd.setCursor(0, 3);
+    lcd.print("Press: Save");
+    
+  } else if (currentMode == CALIBRATION_MODE) {
+    lcd.setCursor(0, 0);
+    lcd.print("CALIBRATION MODE");
+    lcd.setCursor(0, 1);
+    lcd.print("V Avg: ");
+    lcd.print(avgVoltage, 1);
+    lcd.print("V   ");
+    lcd.setCursor(0, 2);
+    lcd.print("StdDev: ");
+    lcd.print(voltageStdDev, 1);
+    lcd.print("V  ");
+    lcd.setCursor(0, 3);
+    lcd.print("Press: Next");
+    
+  } else if (currentMode == VOLTAGE_CALIBRATION_MODE) {
+    lcd.setCursor(0, 0);
+    lcd.print("V-CAL MODE");
+    lcd.setCursor(0, 1);
+    lcd.print("Mult: ");
+    lcd.print((int)voltageCalibrationMultiplier);
+    lcd.print("     ");
+    lcd.setCursor(0, 2);
+    lcd.print("Vtg: ");
+    lcd.print(voltage, 1);
+    lcd.print("V     ");
+    lcd.setCursor(0, 3);
+    lcd.print("Press: Channel");
+    
+  } else if (currentMode == CHANNEL_SETTING_MODE) {
+    lcd.setCursor(0, 0);
+    lcd.print("CHANNEL SETTING");
+    lcd.setCursor(0, 1);
+    lcd.print("Current: Ch ");
+    lcd.print(WiFi.channel());
+    lcd.print("   ");
+    lcd.setCursor(0, 2);
+    lcd.print("New: Ch ");
+    lcd.print(newChannel);
+    lcd.print("      ");
+    lcd.setCursor(0, 3);
+    lcd.print("Rotate then Save");
+    
+  } else {
+    lcd.setCursor(0, 0);
+    if (voltage > 10.0) {
+      lcd.print("Voltage: ");
+      lcd.print((int)voltage);
+      lcd.print("V");
+      
+      lcd.setCursor(14, 0);
+      if (millis() - lastSendTime < 2000) {
+        lcd.print(lastSendResult == ESP_OK ? "TX" : "FL");
+      } else {
+        lcd.print("--");
+      }
+    } else {
+      lcd.print("Voltage: OFF    ");
+      lcd.setCursor(14, 0);
+      lcd.print("--");
+    }
+    
+    lcd.setCursor(0, 1);
+    lcd.print("I:");
+    if (current > 0.001) {
+      if (current >= 1.0) {
+        lcd.print(current, 2);
+        lcd.print("A");
+      } else {
+        lcd.print((int)(current * 1000));
+        lcd.print("mA");
+      }
+    } else {
+      lcd.print("0mA");
+    }
+    
+    lcd.setCursor(8, 1);
+    lcd.print("P:");
+    if (power > 0.1) {
+      if (power >= 1000) {
+        lcd.print(power/1000, 1);
+        lcd.print("kW");
+      } else {
+        lcd.print((int)power);
+        lcd.print("W");
+      }
+    } else {
+      lcd.print("0W");
+    }
+    
+    lcd.setCursor(0, 2);
+    if (voltage > 10.0 && current > 0.001) {
+      lcd.print("Status: LOAD ON ");
+    } else if (voltage > 10.0) {
+      lcd.print("Status: MAINS ON");
+    } else if (phantomVoltage > 1.0) {
+      lcd.print("PHANTOM CURRENT ");
+    } else {
+      lcd.print("Status: OFF     ");
+    }
+    
+    lcd.setCursor(0, 3);
+    lcd.print("Ch:");
+    lcd.print(WiFi.channel());
+    
+    lcd.setCursor(5, 3);
+    lcd.print("Tx:");
+    lcd.print(sendAttempts);
+    
+    lcd.setCursor(10, 3);
+    unsigned long uptimeMin = millis() / 60000;
+    if (uptimeMin < 60) {
+      lcd.print(uptimeMin);
+      lcd.print("min");
+    } else {
+      lcd.print(uptimeMin / 60);
+      lcd.print("h");
+      lcd.print(uptimeMin % 60);
+      lcd.print("m");
+    }
+  }
+}
+
+void handleEncoderImproved() {
+  if (encoderChanged) {
+    encoderChanged = false;
+    
+    int posChange = encoderPos - lastEncoderPos;
+    lastEncoderPos = encoderPos;
+    
+    if (currentMode == THRESHOLD_SETTING_MODE) {
+      float adjustment = posChange * CURRENT_THRESHOLD_STEP;
+      currentThreshold += adjustment;
+      
+      if (currentThreshold > MAX_CURRENT_THRESHOLD) {
+        currentThreshold = MAX_CURRENT_THRESHOLD;
+      } else if (currentThreshold < MIN_CURRENT_THRESHOLD) {
+        currentThreshold = MIN_CURRENT_THRESHOLD;
+      }
+      
+      Serial.print("Current Threshold: ");
+      Serial.print((int)(currentThreshold * 1000));
+      Serial.println("mA");
+      
+      beepEncoderRotate();
+      updateLCD();
+      modeChangeTime = millis();
+      
+    } else if (currentMode == VOLTAGE_CALIBRATION_MODE) {
+      voltageCalibrationMultiplier += posChange;
+      
+      if (voltageCalibrationMultiplier < 100) voltageCalibrationMultiplier = 100;
+      if (voltageCalibrationMultiplier > 1000) voltageCalibrationMultiplier = 1000;
+      
+      Serial.print("Voltage Cal Multiplier: ");
+      Serial.println(voltageCalibrationMultiplier, 0);
+      
+      beepEncoderRotate();
+      updateLCD();
+      modeChangeTime = millis();
+      
+    } else if (currentMode == CHANNEL_SETTING_MODE) {
+      newChannel += posChange;
+      
+      if (newChannel > MAX_CHANNEL) {
+        newChannel = MAX_CHANNEL;
+      } else if (newChannel < MIN_CHANNEL) {
+        newChannel = MIN_CHANNEL;
+      }
+      
+      Serial.print("New Channel: ");
+      Serial.println(newChannel);
+      
+      beepEncoderRotate();
+      updateLCD();
+      modeChangeTime = millis();
+    }
+  }
+  
+  if (buttonPressed) {
+    buttonPressed = false;
+    beepButtonPress();
+    
+    if (currentMode == NORMAL_MODE) {
+      currentMode = THRESHOLD_SETTING_MODE;
+      lastMode = NORMAL_MODE;
+      modeChangeTime = millis();
+      Serial.println("==> THRESHOLD SETTING MODE");
+      beepModeChange();
+      updateLCD();
+      
+    } else if (currentMode == THRESHOLD_SETTING_MODE) {
+      preferences.putFloat("cur_thresh", currentThreshold);
+      currentMode = CALIBRATION_MODE;
+      lastMode = THRESHOLD_SETTING_MODE;
+      modeChangeTime = millis();
+      Serial.print("Current Threshold saved: ");
+      Serial.print((int)(currentThreshold * 1000));
+      Serial.println("mA");
+      Serial.println("==> CALIBRATION MODE");
+      beepSaveSuccess();
+      updateLCD();
+      
+    } else if (currentMode == CALIBRATION_MODE) {
+      currentMode = VOLTAGE_CALIBRATION_MODE;
+      lastMode = CALIBRATION_MODE;
+      modeChangeTime = millis();
+      Serial.println("==> VOLTAGE CALIBRATION MODE");
+      Serial.println("Rotate encoder to adjust voltage multiplier");
+      beepModeChange();
+      updateLCD();
+      
+    } else if (currentMode == VOLTAGE_CALIBRATION_MODE) {
+      preferences.putFloat("vol_cal_mult", voltageCalibrationMultiplier);
+      currentMode = CHANNEL_SETTING_MODE;
+      lastMode = VOLTAGE_CALIBRATION_MODE;
+      newChannel = WiFi.channel();
+      modeChangeTime = millis();
+      Serial.println("Voltage calibration saved!");
+      Serial.println("==> CHANNEL SETTING MODE");
+      Serial.print("Current Channel: ");
+      Serial.println(WiFi.channel());
+      Serial.println("Rotate encoder to change channel (1-14)");
+      beepModeChange();
+      updateLCD();
+      
+    } else if (currentMode == CHANNEL_SETTING_MODE) {
+      currentMode = NORMAL_MODE;
+      lastMode = CHANNEL_SETTING_MODE;
+      
+      if (newChannel != targetChannel) {
+        targetChannel = newChannel;
+        
+        Serial.print("Changing to Channel: ");
+        Serial.println(targetChannel);
+        
+        esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+        delay(100);
+        
+        esp_now_peer_info_t peerInfo;
+        memset(&peerInfo, 0, sizeof(peerInfo));
+        memcpy(peerInfo.peer_addr, receiverMAC, 6);
+        
+        esp_now_del_peer(receiverMAC);
+        
+        peerInfo.channel = targetChannel;
+        peerInfo.encrypt = false;
+        peerInfo.ifidx = WIFI_IF_STA;
+        
+        esp_err_t result = esp_now_add_peer(&peerInfo);
+        if (result == ESP_OK) {
+          Serial.println("Channel changed successfully!");
+          beepSaveSuccess();
+        } else {
+          Serial.print("Failed to update peer. Error: ");
+          Serial.println(result);
+          beepError();
+        }
+      } else {
+        Serial.println("Channel unchanged");
+        beepButtonPress();
+      }
+      
+      Serial.println("==> NORMAL MODE");
+      Serial.println("All settings saved!");
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("ALL SETTINGS");
+      lcd.setCursor(0, 1);
+      lcd.print("SAVED!");
+      lcd.setCursor(0, 2);
+      lcd.print("Channel: ");
+      lcd.print(targetChannel);
+      lcd.setCursor(0, 3);
+      lcd.print("Returning...");
+      delay(2000);
+      
+      updateLCD();
+    }
+  }
+}
+
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command.startsWith("vcal ")) {
+      float newCal = command.substring(5).toFloat();
+      if (newCal > 0) {
+        voltageCalibrationMultiplier = newCal;
+        Serial.print("Voltage calibration multiplier set to: ");
+        Serial.println(voltageCalibrationMultiplier, 2);
+        beepSaveSuccess();
+      } else {
+        Serial.println("Invalid voltage calibration value!");
+        beepError();
+      }
+    }
+    else if (command.startsWith("vnoise ")) {
+      float newNoise = command.substring(7).toFloat();
+      if (newNoise >= 0) {
+        voltageNoiseThreshold = newNoise;
+        Serial.print("Voltage noise threshold set to: ");
+        Serial.println(voltageNoiseThreshold, 4);
+        beepSaveSuccess();
+      } else {
+        Serial.println("Invalid voltage noise threshold!");
+        beepError();
+      }
+    }
+    else if (command.startsWith("cthresh ")) {
+      float newThresh = command.substring(8).toFloat();
+      if (newThresh >= 0.001 && newThresh <= 5.0) {
+        currentThreshold = newThresh;
+        Serial.print("Current threshold set to: ");
+        Serial.print((int)(currentThreshold * 1000));
+        Serial.println("mA");
+        beepSaveSuccess();
+      } else {
+        Serial.println("Invalid current threshold! Range: 0.001-5.0 A");
+        beepError();
+      }
+    }
+    else if (command == "vdebug on") {
+      voltageDebugMode = true;
+      Serial.println("Voltage debug mode ON");
+      beepButtonPress();
+    }
+    else if (command == "vdebug off") {
+      voltageDebugMode = false;
+      Serial.println("Voltage debug mode OFF");
+      beepButtonPress();
+    }
+    else if (command == "vsave") {
+      preferences.putFloat("vol_cal_mult", voltageCalibrationMultiplier);
+      preferences.putFloat("vol_noise_th", voltageNoiseThreshold);
+      preferences.putBool("vol_debug", voltageDebugMode);
+      preferences.putUChar("buzzer_vol", buzzerVolume);
+      preferences.putFloat("cur_thresh", currentThreshold);
+      Serial.println("All settings saved to flash memory!");
+      beepSaveSuccess();
+    }
+    else if (command == "vreset") {
+      voltageCalibrationMultiplier = 563.0;
+      voltageNoiseThreshold = 0.12;
+      voltageDebugMode = false;
+      currentThreshold = 0.1;
+      buzzerVolume = 128;
+      preferences.clear();
+      Serial.println("All settings reset to defaults!");
+      beepWarning();
+    }
+    else if (command == "vstatus") {
+      Serial.println("=== System Status ===");
+      Serial.print("Voltage Cal Multiplier: ");
+      Serial.println(voltageCalibrationMultiplier, 2);
+      Serial.print("Voltage Noise Threshold: ");
+      Serial.println(voltageNoiseThreshold, 4);
+      Serial.print("Current Threshold: ");
+      Serial.print((int)(currentThreshold * 1000));
+      Serial.println("mA");
+      Serial.print("Debug Mode: ");
+      Serial.println(voltageDebugMode ? "ON" : "OFF");
+      Serial.print("Buzzer Volume: ");
+      Serial.println(buzzerVolume);
+      Serial.print("Current Voltage: ");
+      Serial.print(voltage, 2);
+      Serial.println("V");
+      Serial.print("Current: ");
+      Serial.print(current * 1000, 1);
+      Serial.println("mA");
+      Serial.print("WiFi Channel: ");
+      Serial.println(WiFi.channel());
+      Serial.println("====================");
+    }
+    else if (command.startsWith("bvol ")) {
+      int newVol = command.substring(5).toInt();
+      if (newVol >= 0 && newVol <= 255) {
+        buzzerVolume = (uint8_t)newVol;
+        Serial.print("Buzzer volume set to: ");
+        Serial.print(buzzerVolume);
+        Serial.println(" (0-255)");
+        
+        if (buzzerVolume > 0) {
+          beepButtonPress();
+        } else {
+          Serial.println("Buzzer is now MUTED");
+        }
+      } else {
+        Serial.println("Invalid buzzer volume! Must be 0-255");
+        beepError();
+      }
+    }
+    else if (command == "btest") {
+      Serial.println("Testing all buzzer tones...");
+      
+      Serial.println("1. Encoder rotate tone");
+      beepEncoderRotate();
+      delay(500);
+      
+      Serial.println("2. Button press tone");
+      beepButtonPress();
+      delay(500);
+      
+      Serial.println("3. Mode change tone");
+      beepModeChange();
+      delay(500);
+      
+      Serial.println("4. Save success tone");
+      beepSaveSuccess();
+      delay(500);
+      
+      Serial.println("5. Warning tone");
+      beepWarning();
+      delay(500);
+      
+      Serial.println("6. Error tone");
+      beepError();
+      delay(500);
+      
+      Serial.println("Buzzer test complete!");
+    }
+    else if (command == "bmute") {
+      buzzerVolume = 0;
+      Serial.println("Buzzer MUTED (volume = 0)");
+    }
+    else if (command == "bunmute") {
+      buzzerVolume = 128;
+      Serial.println("Buzzer UNMUTED (volume = 128)");
+      beepButtonPress();
+    }
+    else if (command.startsWith("channel ")) {
+      int newCh = command.substring(8).toInt();
+      if (newCh >= MIN_CHANNEL && newCh <= MAX_CHANNEL) {
+        targetChannel = newCh;
+        
+        Serial.print("Setting WiFi channel to: ");
+        Serial.println(targetChannel);
+        
+        esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+        delay(100);
+        
+        esp_now_peer_info_t peerInfo;
+        memset(&peerInfo, 0, sizeof(peerInfo));
+        memcpy(peerInfo.peer_addr, receiverMAC, 6);
+        
+        esp_now_del_peer(receiverMAC);
+        
+        peerInfo.channel = targetChannel;
+        peerInfo.encrypt = false;
+        peerInfo.ifidx = WIFI_IF_STA;
+        
+        esp_err_t result = esp_now_add_peer(&peerInfo);
+        if (result == ESP_OK) {
+          Serial.println("Channel changed successfully!");
+          beepSaveSuccess();
+        } else {
+          Serial.print("Failed to update peer. Error: ");
+          Serial.println(result);
+          beepError();
+        }
+        
+        Serial.print("Actual WiFi channel: ");
+        Serial.println(WiFi.channel());
+      } else {
+        Serial.print("Invalid channel! Must be ");
+        Serial.print(MIN_CHANNEL);
+        Serial.print("-");
+        Serial.println(MAX_CHANNEL);
+        beepError();
+      }
+    }
+    else if (command == "help" || command == "vhelp") {
+      printHelp();
+    }
+    else if (command.length() > 0) {
+      Serial.println("Unknown command. Type 'help' for available commands.");
+      beepError();
+    }
+  }
+}
+
+void printHelp() {
+  Serial.println("\n=== Available Commands ===");
+  Serial.println("\nVoltage Calibration:");
+  Serial.println("- vcal XXX - Set voltage calibration multiplier");
+  Serial.println("- vnoise XXX - Set voltage noise threshold");
+  Serial.println("- vdebug on/off - Toggle voltage debug mode");
+  Serial.println("- vsave - Save all settings to flash");
+  Serial.println("- vreset - Reset all settings to defaults");
+  Serial.println("- vstatus - Show complete system status");
+  Serial.println("\nCurrent Threshold:");
+  Serial.println("- cthresh X.XX - Set current threshold (A)");
+  Serial.println("  Example: cthresh 0.05 (sets 50mA threshold)");
+  Serial.println("\nBuzzer Control:");
+  Serial.println("- bvol XXX - Set buzzer volume (0-255)");
+  Serial.println("  * 0 = Muted");
+  Serial.println("  * 64 = 25% volume (quiet)");
+  Serial.println("  * 128 = 50% volume (default)");
+  Serial.println("  * 192 = 75% volume");
+  Serial.println("  * 255 = 100% volume (maximum)");
+  Serial.println("- btest - Test all buzzer tones");
+  Serial.println("- bmute - Mute buzzer");
+  Serial.println("- bunmute - Unmute buzzer");
+  Serial.println("\nWiFi Channel:");
+  Serial.println("- channel XXX - Set WiFi channel (1-14)");
+  Serial.println("\nGeneral:");
+  Serial.println("- help/vhelp - Show this help");
+  Serial.println("========================\n");
+}

@@ -1,0 +1,17 @@
+Component,Quantity,Purpose
+,,
+ESP32 Development Board,2,Sensor and receiver processing
+,,
+SCT-013-000,1,Non-invasive AC current measurement
+,,
+ZMPT101B,1,AC voltage measurement
+,,
+ADS1115,1,External ADC
+,,
+20x4 I2C LCD,2,Local measurement display
+,,
+Buzzer,2,Audible alerts
+,,
+Rotary Encoder,1,User configuration
+,,
+AC-DC Power Module,1,Low-voltage power supply
